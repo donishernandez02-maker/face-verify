@@ -1,4 +1,4 @@
-# main.py  (v1.6.4)
+# main.py  (v1.6.5)
 import io
 import os
 from typing import Dict, Tuple, List, Optional
@@ -15,7 +15,7 @@ import cv2
 # =========================
 # Config
 # =========================
-APP_VERSION           = "1.6.4"
+APP_VERSION           = "1.6.5"
 APP_DETECTOR_DEFAULT  = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
 DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
 DOC_MODE_DEFAULT      = "auto"       # auto (strict->loose) | strict | loose
@@ -35,13 +35,15 @@ MAX_SELFIE_FACES      = 1      # exactamente una cara en selfie
 AR_LOOSE_MIN_G        = 0.75
 AR_LOOSE_MAX_G        = 2.80
 EDGE_DENS_MIN_G       = 0.006
-EDGE_DENS_MAX_G       = 0.33    # <- por defecto; ahora se puede subir por form (edge_max_global)
+EDGE_DENS_MAX_G       = 0.33    # <- por defecto; se puede subir por form (edge_max_global)
+TEXT_DENS_MIN_G       = 0.0     # <- FIX: mínimo global para densidad de texto
+TEXT_DENS_MAX_G       = 0.030   # cap superior global fijo
 
 # LOOSENED (CENTER CROP)
 AR_LOOSE_MIN_C        = 0.70
 AR_LOOSE_MAX_C        = 3.00
 EDGE_DENS_MAX_C       = 0.50
-TEXT_DENS_MAX_C_DEF   = 0.08    # <- por defecto; ahora se puede subir por form (text_max_center)
+TEXT_DENS_MAX_C_DEF   = 0.08    # <- por defecto; se puede subir por form (text_max_center)
 
 CENTER_FRACTION       = 0.70   # 70% central
 
@@ -284,14 +286,13 @@ async def why_doc(
 
         # métricas
         m_global = compute_metrics(id_arr_rgb)
-        # checks global
         ar_g = m_global["ar_global"]
         edge_g = m_global["edge_density"]
         text_g = m_global["text_density"]
 
-        ar_ok_g = AR_LOOSE_MIN_G <= ar_g <= AR_LOOSE_MAX_G
+        ar_ok_g    = AR_LOOSE_MIN_G <= ar_g <= AR_LOOSE_MAX_G
         edges_ok_g = EDGE_DENS_MIN_G <= edge_g <= edge_global_cap
-        text_ok_g = TEXT_DENS_MIN_G <= text_g <= 0.030  # cap superior global, fijo
+        text_ok_g  = TEXT_DENS_MIN_G <= text_g <= TEXT_DENS_MAX_G
 
         result = {
             "ok": True,
@@ -303,6 +304,7 @@ async def why_doc(
                 "edges_ok": edges_ok_g,
                 "text_ok": text_ok_g,
                 "edge_cap_used": edge_global_cap,
+                "text_cap_global": TEXT_DENS_MAX_G,
             },
             "version": APP_VERSION,
             "relax": bool(relax),
@@ -316,9 +318,9 @@ async def why_doc(
             edge_c = m_center["edge_density"]
             text_c = m_center["text_density"]
 
-            ar_ok_c = AR_LOOSE_MIN_C <= ar_c <= AR_LOOSE_MAX_C
+            ar_ok_c    = AR_LOOSE_MIN_C <= ar_c <= AR_LOOSE_MAX_C
             edges_ok_c = edge_c <= EDGE_DENS_MAX_C
-            text_ok_c = text_c <= text_center_cap
+            text_ok_c  = text_c <= text_center_cap
 
             result["metrics_center"] = m_center
             result["center_checks"] = {
@@ -452,7 +454,7 @@ async def verify(
 
             ar_ok_g    = AR_LOOSE_MIN_G <= ar_g <= AR_LOOSE_MAX_G
             edges_ok_g = EDGE_DENS_MIN_G <= d_edge_g <= edge_global_cap
-            text_ok_g  = TEXT_DENS_MIN_G <= d_text_g  <= 0.030
+            text_ok_g  = TEXT_DENS_MIN_G <= d_text_g  <= TEXT_DENS_MAX_G
 
             ok_global = bool( (doc_ok_face and ar_ok_g and edges_ok_g) or text_ok_g )
 
@@ -485,7 +487,8 @@ async def verify(
                     "ar": ar_g, "edge_density": d_edge_g, "text_density": d_text_g,
                     "doc_ok_face": doc_ok_face,
                     "ar_ok": ar_ok_g, "edges_ok": edges_ok_g, "text_ok": text_ok_g,
-                    "edge_cap_used": edge_global_cap
+                    "edge_cap_used": edge_global_cap,
+                    "text_cap_global": TEXT_DENS_MAX_G,
                 },
                 "used_center_crop": bool(use_center_crop),
             }
