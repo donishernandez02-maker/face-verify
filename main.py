@@ -1,4 +1,4 @@
-# main.py  (v1.6.5)
+# main.py  (v1.6.6)
 import io
 import os
 from typing import Dict, Tuple, List, Optional
@@ -15,7 +15,7 @@ import cv2
 # =========================
 # Config
 # =========================
-APP_VERSION           = "1.6.5"
+APP_VERSION           = "1.6.6"
 APP_DETECTOR_DEFAULT  = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
 DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
 DOC_MODE_DEFAULT      = "auto"       # auto (strict->loose) | strict | loose
@@ -30,20 +30,22 @@ CARD_ANGLE_TOL_BASE     = 40.0
 # Selfie / Face
 MIN_FACE_FRAC         = 0.12   # cara ≥12% del lado menor del frame
 MAX_SELFIE_FACES      = 1      # exactamente una cara en selfie
+DOC_MAX_FACE_FRAC     = 0.45   # cara en ID no debe ocupar más del 45% del lado menor
 
 # LOOSENED (GLOBAL)
 AR_LOOSE_MIN_G        = 0.75
 AR_LOOSE_MAX_G        = 2.80
-EDGE_DENS_MIN_G       = 0.006
-EDGE_DENS_MAX_G       = 0.33    # <- por defecto; se puede subir por form (edge_max_global)
-TEXT_DENS_MIN_G       = 0.0     # <- FIX: mínimo global para densidad de texto
-TEXT_DENS_MAX_G       = 0.030   # cap superior global fijo
+EDGE_DENS_MIN_G       = 0.010    # ↑ un poco el mínimo
+EDGE_DENS_MAX_G       = 0.33
+TEXT_DENS_MIN_G       = 0.0
+TEXT_DENS_MAX_G       = 0.030
 
 # LOOSENED (CENTER CROP)
 AR_LOOSE_MIN_C        = 0.70
 AR_LOOSE_MAX_C        = 3.00
 EDGE_DENS_MAX_C       = 0.50
-TEXT_DENS_MAX_C_DEF   = 0.08    # <- por defecto; se puede subir por form (text_max_center)
+TEXT_DENS_MAX_C_DEF   = 0.12     # ↓ por defecto más estricto que 0.16
+TEXT_DENS_MIN_C_DEF   = 0.010    # nuevo: mínimo en centro para evitar imágenes “planas”
 
 CENTER_FRACTION       = 0.70   # 70% central
 
@@ -259,6 +261,8 @@ async def why_doc(
     use_center_crop: bool = Form(False),
     text_max_center: float = Form(None),
     edge_max_global: float = Form(None),
+    text_min_center: float = Form(None),
+    edge_min_global: float = Form(None),
 ):
     try:
         # Ajustes base
@@ -270,28 +274,28 @@ async def why_doc(
 
         # Overrides
         text_center_cap = float(text_max_center) if text_max_center not in (None, "") else TEXT_DENS_MAX_C_DEF
+        text_center_min = float(text_min_center) if text_min_center not in (None, "") else TEXT_DENS_MIN_C_DEF
         edge_global_cap = float(edge_max_global) if edge_max_global not in (None, "") else EDGE_DENS_MAX_G
+        edge_global_min = float(edge_min_global) if edge_min_global not in (None, "") else EDGE_DENS_MIN_G
 
         id_bytes = await id_image.read()
         id_pil = auto_orient(Image.open(io.BytesIO(id_bytes)))
         id_pil = upscale_if_tiny(id_pil, 500)
         id_arr_rgb = pil_to_array(id_pil)
 
-        # tarjeta rotation-aware
         card_like, card_meta = detect_card_any_rotation(
             id_arr_rgb,
             CARD_MIN_AREA_FRAC, CARD_MAX_AREA_FRAC,
             CARD_AR_MIN, CARD_AR_MAX, CARD_ANGLE_TOL
         )
 
-        # métricas
         m_global = compute_metrics(id_arr_rgb)
         ar_g = m_global["ar_global"]
         edge_g = m_global["edge_density"]
         text_g = m_global["text_density"]
 
         ar_ok_g    = AR_LOOSE_MIN_G <= ar_g <= AR_LOOSE_MAX_G
-        edges_ok_g = EDGE_DENS_MIN_G <= edge_g <= edge_global_cap
+        edges_ok_g = edge_global_min <= edge_g <= edge_global_cap
         text_ok_g  = TEXT_DENS_MIN_G <= text_g <= TEXT_DENS_MAX_G
 
         result = {
@@ -304,6 +308,7 @@ async def why_doc(
                 "edges_ok": edges_ok_g,
                 "text_ok": text_ok_g,
                 "edge_cap_used": edge_global_cap,
+                "edge_min_used": edge_global_min,
                 "text_cap_global": TEXT_DENS_MAX_G,
             },
             "version": APP_VERSION,
@@ -320,14 +325,13 @@ async def why_doc(
 
             ar_ok_c    = AR_LOOSE_MIN_C <= ar_c <= AR_LOOSE_MAX_C
             edges_ok_c = edge_c <= EDGE_DENS_MAX_C
-            text_ok_c  = text_c <= text_center_cap
+            text_ok_c  = (text_center_min <= text_c <= text_center_cap)
 
             result["metrics_center"] = m_center
             result["center_checks"] = {
-                "ar_ok": ar_ok_c,
-                "edges_ok": edges_ok_c,
-                "text_ok": text_ok_c,
+                "ar_ok": ar_ok_c, "edges_ok": edges_ok_c, "text_ok": text_ok_c,
                 "text_cap_used": text_center_cap,
+                "text_min_used": text_center_min,
             }
 
         return result
@@ -382,6 +386,10 @@ async def verify(
     use_center_crop: bool = Form(False),
     text_max_center: float = Form(None),
     edge_max_global: float = Form(None),
+    text_min_center: float = Form(None),
+    edge_min_global: float = Form(None),
+    require_quad:    bool  = Form(True),   # nuevo: exige 4 lados en doc
+    selfie_not_card: bool  = Form(True),   # nuevo: selfie NO debe parecer tarjeta
 ) -> Dict:
     try:
         # Ajustes base
@@ -393,7 +401,9 @@ async def verify(
 
         # Overrides heurísticos
         text_center_cap = float(text_max_center) if text_max_center not in (None, "") else TEXT_DENS_MAX_C_DEF
+        text_center_min = float(text_min_center) if text_min_center not in (None, "") else TEXT_DENS_MIN_C_DEF
         edge_global_cap = float(edge_max_global) if edge_max_global not in (None, "") else EDGE_DENS_MAX_G
+        edge_global_min = float(edge_min_global) if edge_min_global not in (None, "") else EDGE_DENS_MIN_G
 
         # 1) Cargar
         id_bytes = await id_image.read()
@@ -405,7 +415,7 @@ async def verify(
         id_arr_rgb = pil_to_array(id_pil)
         sf_arr_rgb = pil_to_array(sf_pil)
 
-        # 2) Documento
+        # 2) Documento: detección de tarjeta + cara chica
         card_like, card_meta = detect_card_any_rotation(
             id_arr_rgb,
             CARD_MIN_AREA_FRAC, CARD_MAX_AREA_FRAC,
@@ -427,17 +437,16 @@ async def verify(
         doc_h, doc_w = id_arr_rgb.shape[:2]
         doc_ok_face = False
         if doc_faces:
-            f = pick_best_face(doc_faces, prefer_larger=False)
-            if f is not None:
-                try:
-                    fa = sorted(doc_faces, key=lambda d: d.get("confidence", 0), reverse=True)[0].get("facial_area", {})
-                    fw, fh = fa.get("w", 0), fa.get("h", 0)
-                    min_side = min(doc_w, doc_h)
-                    doc_ok_face = max(fw, fh) <= 0.45 * float(min_side)
-                except Exception:
-                    doc_ok_face = True
+            # cara del doc no debe ser gigante
+            try:
+                fa = sorted(doc_faces, key=lambda d: d.get("confidence", 0), reverse=True)[0].get("facial_area", {})
+                fw, fh = fa.get("w", 0), fa.get("h", 0)
+                min_side = min(doc_w, doc_h)
+                doc_ok_face = max(fw, fh) <= DOC_MAX_FACE_FRAC * float(min_side)
+            except Exception:
+                doc_ok_face = True
 
-        # decisiones
+        # decisiones strict/loose
         doc_mode_req = (doc_mode or DOC_MODE_DEFAULT).lower().strip()
 
         def strict_decision() -> Tuple[bool, Dict]:
@@ -453,7 +462,7 @@ async def verify(
             d_text_g = text_density_mser(bgr_full)
 
             ar_ok_g    = AR_LOOSE_MIN_G <= ar_g <= AR_LOOSE_MAX_G
-            edges_ok_g = EDGE_DENS_MIN_G <= d_edge_g <= edge_global_cap
+            edges_ok_g = edge_global_min <= d_edge_g <= edge_global_cap
             text_ok_g  = TEXT_DENS_MIN_G <= d_text_g  <= TEXT_DENS_MAX_G
 
             ok_global = bool( (doc_ok_face and ar_ok_g and edges_ok_g) or text_ok_g )
@@ -470,12 +479,13 @@ async def verify(
 
                 ar_ok_c    = AR_LOOSE_MIN_C <= ar_c <= AR_LOOSE_MAX_C
                 edges_ok_c = d_edge_c <= EDGE_DENS_MAX_C
-                text_ok_c  = d_text_c <= text_center_cap
+                text_ok_c  = (text_center_min <= d_text_c <= text_center_cap)
 
                 criteria_center = {
                     "ar": ar_c, "edge_density": d_edge_c, "text_density": d_text_c,
                     "ar_ok": ar_ok_c, "edges_ok": edges_ok_c, "text_ok": text_ok_c,
-                    "text_cap_used": text_center_cap
+                    "text_cap_used": text_center_cap,
+                    "text_min_used": text_center_min,
                 }
 
                 ok_center = bool( (doc_ok_face and ar_ok_c and edges_ok_c) or text_ok_c )
@@ -488,6 +498,7 @@ async def verify(
                     "doc_ok_face": doc_ok_face,
                     "ar_ok": ar_ok_g, "edges_ok": edges_ok_g, "text_ok": text_ok_g,
                     "edge_cap_used": edge_global_cap,
+                    "edge_min_used": edge_global_min,
                     "text_cap_global": TEXT_DENS_MAX_G,
                 },
                 "used_center_crop": bool(use_center_crop),
@@ -500,27 +511,50 @@ async def verify(
         loose_meta = {}
         strict_meta = {}
 
+        # Reglas de aceptación (con require_quad):
         if doc_mode_req == "strict":
             doc_ok, strict_meta = strict_decision()
             doc_mode_used = "strict"
         elif doc_mode_req == "loose":
-            doc_ok, loose_meta = loose_decision()
-            doc_mode_used = "loose"
-            if doc_ok:
-                card_meta = {**(card_meta or {}), **(loose_meta or {})}
+            # si require_quad está activo, obligamos card_like en loose también
+            if require_quad and not card_like:
+                doc_ok = False
+                loose_meta = {"blocked_by_require_quad": True}
+                doc_mode_used = "loose"
+            else:
+                doc_ok, loose_meta = loose_decision()
+                doc_mode_used = "loose"
+                if doc_ok:
+                    card_meta = {**(card_meta or {}), **(loose_meta or {})}
         else:
+            # auto: intenta strict; si falla, intenta loose (respetando require_quad)
             doc_ok, strict_meta = strict_decision()
             if doc_ok:
                 doc_mode_used = "strict"
             else:
-                doc_ok, loose_meta = loose_decision()
-                if doc_ok:
-                    doc_mode_used = "loose"
-                    card_meta = {**(card_meta or {}), **(loose_meta or {})}
-                else:
+                if require_quad and not card_like:
+                    doc_ok = False
+                    loose_meta = {"blocked_by_require_quad": True}
                     doc_mode_used = "auto_failed"
+                else:
+                    doc_ok, loose_meta = loose_decision()
+                    if doc_ok:
+                        doc_mode_used = "loose"
+                        card_meta = {**(card_meta or {}), **(loose_meta or {})}
+                    else:
+                        doc_mode_used = "auto_failed"
 
-        # 3) Selfie
+        # 3) Selfie: 1 cara grande suficiente y NO tarjeta si así se pide
+        # check selfie-not-card
+        selfie_card_like = False
+        if selfie_not_card:
+            sc_like, _ = detect_card_any_rotation(
+                sf_arr_rgb,
+                CARD_MIN_AREA_FRAC, CARD_MAX_AREA_FRAC,
+                CARD_AR_MIN, CARD_AR_MAX, CARD_ANGLE_TOL
+            )
+            selfie_card_like = bool(sc_like)
+
         sf_faces = []
         try:
             sf_faces = extract_faces(sf_arr_rgb, backend="retinaface")
@@ -532,7 +566,7 @@ async def verify(
 
         selfie_ok = False
         selfie_face_img = None
-        if sf_faces and len(sf_faces) == MAX_SELFIE_FACES:
+        if (not selfie_card_like) and sf_faces and len(sf_faces) == MAX_SELFIE_FACES:
             face_pick = pick_best_face(sf_faces, prefer_larger=True)
             if face_pick is not None:
                 selfie_face_img = face_pick
@@ -552,8 +586,9 @@ async def verify(
                 "selfie_ok": bool(selfie_ok),
                 "reason": {
                     "doc": ("not_card_like" if not doc_ok else "ok"),
-                    "selfie": ("face_count!=1_or_too_small" if not selfie_ok else "ok")
+                    "selfie": ("face_count!=1_or_too_small" if not selfie_ok else ("ok" if not selfie_card_like else "selfie_looks_like_card"))
                 },
+                "selfie_card_like": bool(selfie_card_like),
                 "card_meta": card_meta,
                 "loose_meta": (loose_meta or {}),
                 "strict_meta": (strict_meta or {}),
@@ -610,7 +645,11 @@ async def verify(
             "use_center_crop": bool(use_center_crop),
             "version": APP_VERSION,
             "text_cap_used": text_center_cap,
+            "text_min_used": text_center_min,
             "edge_cap_used": edge_global_cap,
+            "edge_min_used": edge_global_min,
+            "require_quad": bool(require_quad),
+            "selfie_not_card": bool(selfie_not_card),
         })
         return ver
 
