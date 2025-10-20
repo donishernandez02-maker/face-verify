@@ -1,7 +1,7 @@
 # main.py
 import io
 import os
-from typing import Dict
+from typing import Dict, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -12,10 +12,10 @@ from PIL import Image, UnidentifiedImageError
 import numpy as np
 
 # Config
-APP_DETECTOR = "retinaface"  # retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
-DEFAULT_THRESHOLD = float(os.getenv("ARC_THRESHOLD", "0.38"))
+APP_DETECTOR_DEFAULT = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
+DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
 
-app = FastAPI(title="Face Verify API", version="1.0.0")
+app = FastAPI(title="Face Verify API", version="1.1.0")
 
 # CORS (útil para pruebas desde frontends)
 app.add_middleware(
@@ -41,6 +41,30 @@ def upscale_if_tiny(pil_img: Image.Image, min_side_target: int = 400) -> Image.I
         new_size = (int(w * scale), int(h * scale))
         pil_img = pil_img.resize(new_size, Image.LANCZOS)
     return pil_img
+
+def do_verify(id_arr, sf_arr, threshold: float, detector: str, enforce: bool) -> Tuple[dict, dict]:
+    """Ejecuta DeepFace.verify con parámetros dados. Devuelve (payload, meta)."""
+    result = DeepFace.verify(
+        img1_path=id_arr,
+        img2_path=sf_arr,
+        model_name="ArcFace",
+        detector_backend=detector,
+        distance_metric="cosine",
+        enforce_detection=bool(enforce)
+    )
+    dist = float(result.get("distance", 1.0))
+    verified = dist <= float(threshold)
+    payload = {
+        "ok": True,
+        "verified": bool(verified),
+        "distance": dist,
+        "threshold": float(threshold),
+        "model": "ArcFace",
+        "detector": detector,
+        "enforce": bool(enforce),
+    }
+    meta = {"fallback_used": False}
+    return payload, meta
 
 # Health
 @app.get("/health")
@@ -83,14 +107,14 @@ async def debug_uploads(
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)}"}
 
-# Verificación
+# Verificación con fallback auto
 @app.post("/verify")
 async def verify(
     id_image: UploadFile = File(..., description="Imagen del documento (frontal)"),
     selfie:   UploadFile = File(..., description="Selfie a validar"),
     threshold: float = Form(DEFAULT_THRESHOLD),
-    detector:  str   = Form(APP_DETECTOR),  # permite sobreescribir: opencv, mtcnn, etc.
-    enforce:   bool  = Form(True)           # exigir detección de rostro (True recomendado)
+    detector:  str   = Form(APP_DETECTOR_DEFAULT),  # auto (default) | retinaface | opencv | ...
+    enforce:   bool  = Form(True)                   # solo aplica si detector != auto
 ) -> Dict:
     try:
         # Leer archivos
@@ -109,28 +133,32 @@ async def verify(
         id_arr = pil_to_array(id_pil)
         sf_arr = pil_to_array(sf_pil)
 
-        # Verificar con DeepFace (ArcFace + métrica coseno)
-        result = DeepFace.verify(
-            img1_path=id_arr,
-            img2_path=sf_arr,
-            model_name="ArcFace",
-            detector_backend=detector,
-            distance_metric="cosine",
-            enforce_detection=bool(enforce)
-        )
-
-        dist = float(result.get("distance", 1.0))
-        verified = dist <= float(threshold)
-
-        return {
-            "ok": True,
-            "verified": bool(verified),
-            "distance": dist,
-            "threshold": float(threshold),
-            "model": "ArcFace",
-            "detector": detector,
-            "enforce": bool(enforce)
-        }
+        # Modo AUTO: intenta retinaface/enforce=True y si falla -> opencv/enforce=False
+        if detector.lower() == "auto":
+            try:
+                payload, meta = do_verify(id_arr, sf_arr, threshold, detector="retinaface", enforce=True)
+                payload["fallback_used"] = False
+                payload["detector"] = "retinaface"
+                payload["enforce"] = True
+                return payload
+            except Exception as e1:
+                try:
+                    payload, meta = do_verify(id_arr, sf_arr, threshold, detector="opencv", enforce=False)
+                    payload["fallback_used"] = True
+                    payload["detector"] = "opencv"
+                    payload["enforce"] = False
+                    payload["note"] = f"retinaface failed: {type(e1).__name__}"
+                    return payload
+                except Exception as e2:
+                    return JSONResponse(
+                        status_code=200,
+                        content={"ok": False, "error": f"FallbackError: {type(e1).__name__} -> {type(e2).__name__}"}
+                    )
+        else:
+            # Modo manual (respetar detector/enforce recibidos)
+            payload, _meta = do_verify(id_arr, sf_arr, threshold, detector=detector, enforce=enforce)
+            payload["fallback_used"] = False
+            return payload
 
     except Exception as e:
         # No tiramos 500 para facilitar el manejo del cliente
