@@ -1,4 +1,4 @@
-# main.py  (v1.6.2)
+# main.py  (v1.6.3)
 import io
 import os
 from typing import Dict, Tuple, List
@@ -15,7 +15,7 @@ import cv2
 # =========================
 # Config
 # =========================
-APP_VERSION           = "1.6.2"
+APP_VERSION           = "1.6.3"
 APP_DETECTOR_DEFAULT  = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
 DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
 DOC_MODE_DEFAULT      = "auto"       # auto (strict->loose) | strict | loose
@@ -257,7 +257,7 @@ async def why_doc(
     relax: bool = Form(False),
     use_center_crop: bool = Form(False)
 ):
-    try {
+    try:
         # Ajustes según relax
         CARD_MIN_AREA_FRAC = CARD_MIN_AREA_FRAC_BASE * (0.8 if relax else 1.0)
         CARD_MAX_AREA_FRAC = CARD_MAX_AREA_FRAC_BASE
@@ -295,7 +295,7 @@ async def why_doc(
         if use_center_crop:
             out["metrics_center"] = m_center
         return out
-    } except Exception as e:
+    except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {str(e)}", "version": APP_VERSION}
 
 @app.post("/debug")
@@ -411,6 +411,7 @@ async def verify(
             ok_global = bool( (doc_ok_face and ar_ok_g and edges_ok_g) or text_ok_g )
 
             ok_center = False
+            criteria_center = None
             if use_center_crop:
                 center_rgb = crop_center(id_arr_rgb, CENTER_FRACTION)
                 ch, cw = center_rgb.shape[:2]
@@ -422,6 +423,11 @@ async def verify(
                 ar_ok_c    = AR_LOOSE_MIN_C <= ar_c <= AR_LOOSE_MAX_C
                 edges_ok_c = d_edge_c <= EDGE_DENS_MAX_C
                 text_ok_c  = d_text_c <= TEXT_DENS_MAX_C
+
+                criteria_center = {
+                    "ar": ar_c, "edge_density": d_edge_c, "text_density": d_text_c,
+                    "ar_ok": ar_ok_c, "edges_ok": edges_ok_c, "text_ok": text_ok_c
+                }
 
                 ok_center = bool( (doc_ok_face and ar_ok_c and edges_ok_c) or text_ok_c )
 
@@ -435,11 +441,8 @@ async def verify(
                 },
                 "used_center_crop": bool(use_center_crop),
             }
-            if use_center_crop:
-                meta_patch["criteria_center"] = {
-                    "ar": ar_c, "edge_density": d_edge_c, "text_density": d_text_c,
-                    "ar_ok": ar_ok_c, "edges_ok": edges_ok_c, "text_ok": text_ok_c
-                }
+            if criteria_center is not None:
+                meta_patch["criteria_center"] = criteria_center
             return ok, meta_patch
 
         doc_mode_used = None
@@ -506,7 +509,7 @@ async def verify(
                 "version": APP_VERSION
             }
 
-        # 4) Verificación
+        # 4) Verificación (cara de doc vs selfie)
         doc_face_img = pick_best_face(doc_faces, prefer_larger=False)
         if doc_face_img is None or selfie_face_img is None:
             return {"ok": False, "reason": "face_crop_failed", "doc_mode_used": doc_mode_used, "version": APP_VERSION}
