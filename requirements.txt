@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+deepface
+opencv-python-headless
+retina-face
+onnxruntime
+numpy
+Pillow
