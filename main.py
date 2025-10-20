@@ -1,4 +1,4 @@
-# main.py
+# main.py  (v1.6.0)
 import io
 import os
 from typing import Dict, Tuple, List
@@ -15,21 +15,29 @@ import cv2
 # =========================
 # Config
 # =========================
-APP_VERSION           = "1.5.0"
+APP_VERSION           = "1.6.0"
 APP_DETECTOR_DEFAULT  = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
 DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
 DOC_MODE_DEFAULT      = "auto"       # auto (strict->loose) | strict | loose
 
-# Heurísticas de documento (ID card) — relajadas para robustez
-CARD_MIN_AREA_FRAC    = 0.08
-CARD_MAX_AREA_FRAC    = 0.98
-CARD_AR_MIN           = 0.90
-CARD_AR_MAX           = 2.20
-CARD_ANGLE_TOL        = 35.0
+# Heurísticas de documento (ID card)
+CARD_MIN_AREA_FRAC    = 0.06
+CARD_MAX_AREA_FRAC    = 0.985
+CARD_AR_MIN           = 0.80
+CARD_AR_MAX           = 2.60
+CARD_ANGLE_TOL        = 40.0
 
 # Selfie / Face
 MIN_FACE_FRAC         = 0.12   # cara ≥12% del lado menor del frame
 MAX_SELFIE_FACES      = 1      # exactamente una cara en selfie
+
+# Loose extra: texto + bordes
+AR_LOOSE_MIN          = 0.75
+AR_LOOSE_MAX          = 2.80
+EDGE_DENS_MIN         = 0.006
+EDGE_DENS_MAX         = 0.33
+TEXT_DENS_MIN         = 0.0012
+TEXT_DENS_MAX         = 0.030
 
 app = FastAPI(title="Face Verify API", version=APP_VERSION)
 
@@ -90,14 +98,21 @@ def _quad_is_rect_like(cnt: np.ndarray) -> bool:
             return False
     return True
 
+def _prep_edges(gray: np.ndarray) -> np.ndarray:
+    """Suaviza, cierra huecos y detecta bordes robustos."""
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    # morfología: close para “cerrar” el borde de la tarjeta
+    kernel = np.ones((5,5), np.uint8)
+    closed = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, kernel, iterations=1)
+    edges = cv2.Canny(closed, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+    return edges
+
 def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
     """Detecta cuadrilátero grande tipo tarjeta/ID en la orientación dada."""
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
-
-    edges = cv2.Canny(gray, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+    edges = _prep_edges(gray)
 
     cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -106,7 +121,7 @@ def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
     area_img = w * h
 
-    for c in cnts[:10]:
+    for c in cnts[:20]:
         area = cv2.contourArea(c)
         if area <= 1:
             continue
@@ -114,7 +129,7 @@ def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
         if frac < CARD_MIN_AREA_FRAC or frac > CARD_MAX_AREA_FRAC:
             continue
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        approx = cv2.approxPolyDP(c, 0.03 * peri, True)  # un poco más laxo
         if len(approx) == 4:
             x, y, ww, hh = cv2.boundingRect(approx)
             ar = ww / float(hh + 1e-9)
@@ -125,9 +140,43 @@ def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
 
 def edge_density(bgr: np.ndarray) -> float:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    e = cv2.Canny(gray, 50, 150)
+    e = _prep_edges(gray)
     h, w = e.shape[:2]
     return float(np.count_nonzero(e)) / float(h * w + 1e-9)
+
+def text_density_mser(bgr: np.ndarray) -> float:
+    """Aproxima densidad de texto con MSER; devuelve fracción de pixeles cubierta por regiones MSER."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    # normaliza un poco el contraste
+    gray = cv2.equalizeHist(gray)
+
+    try:
+        mser = cv2.MSER_create(_delta=5, _min_area=60, _max_area=5000)
+    except TypeError:
+        # Firmas viejas de OpenCV
+        mser = cv2.MSER_create()
+
+    regions, _ = mser.detectRegions(gray)
+    mask = np.zeros_like(gray, dtype=np.uint8)
+
+    h, w = gray.shape[:2]
+    area_img = float(h * w)
+    area_mser = 0.0
+
+    for r in regions[:3000]:
+        x, y, ww, hh = cv2.boundingRect(r.reshape(-1, 1, 2))
+        # filtritos rápidos para no contar ruido grande/rarísimo
+        if ww * hh < 60 or ww * hh > 20000:
+            continue
+        # relación de aspecto razonable para “cajas de texto”
+        ar = ww / float(hh + 1e-9)
+        if ar < 0.5 or ar > 12.0:
+            continue
+        area_mser += ww * hh
+        cv2.rectangle(mask, (x, y), (x + ww, y + hh), 255, -1)
+
+    dens = float(np.count_nonzero(mask)) / (area_img + 1e-9)
+    return dens
 
 def detect_card_any_rotation(img_rgb: np.ndarray):
     """Prueba la heurística tarjeta a 0/90/180/270°. Devuelve (ok, meta) con meta['rotation']."""
@@ -197,6 +246,38 @@ def do_verify(id_arr, sf_arr, threshold: float, detector: str, enforce: bool) ->
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "healthy", "version": APP_VERSION}
+
+@app.post("/why-doc")
+async def why_doc(
+    id_image: UploadFile = File(..., description="Imagen del documento (frontal)")
+):
+    try:
+        id_bytes = await id_image.read()
+        id_pil = auto_orient(Image.open(io.BytesIO(id_bytes)))
+        id_pil = upscale_if_tiny(id_pil, 500)
+        id_arr_rgb = pil_to_array(id_pil)
+
+        # tarjeta rotation-aware
+        card_like, card_meta = detect_card_any_rotation(id_arr_rgb)
+
+        # métricas globales
+        bgr = cv2.cvtColor(id_arr_rgb, cv2.COLOR_RGB2BGR)
+        h, w = id_arr_rgb.shape[:2]
+        ar_global = w / float(h + 1e-9)
+        edens = edge_density(bgr)
+        tdens = text_density_mser(bgr)
+
+        return {
+            "ok": True,
+            "card_like": bool(card_like),
+            "card_meta": card_meta,
+            "ar_global": ar_global,
+            "edge_density": edens,
+            "text_density": tdens,
+            "version": APP_VERSION
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)}", "version": APP_VERSION}
 
 @app.post("/debug")
 async def debug_uploads(
@@ -283,9 +364,10 @@ async def verify(
                     fa = sorted(doc_faces, key=lambda d: d.get("confidence", 0), reverse=True)[0].get("facial_area", {})
                     fw, fh = fa.get("w", 0), fa.get("h", 0)
                     min_side = min(doc_w, doc_h)
-                    doc_ok_face = max(fw, fh) <= 0.40 * float(min_side)
+                    # pequeño => <= 45% del lado mínimo (un pelín más laxo)
+                    doc_ok_face = max(fw, fh) <= 0.45 * float(min_side)
                 except Exception:
-                    doc_ok_face = True  # si no hay datos, no bloqueamos
+                    doc_ok_face = True  # si no hay datos, no bloqueamos por aquí
 
         # ---- Decisión strict / loose / auto ----
         doc_mode_req = (doc_mode or DOC_MODE_DEFAULT).lower().strip()
@@ -295,17 +377,29 @@ async def verify(
             return bool(card_like and doc_ok_face)
 
         def loose_decision() -> Tuple[bool, Dict]:
-            # Señales globales: AR + densidad de bordes
+            # Señales globales: AR + densidad de bordes + densidad de texto
             bgr_full = cv2.cvtColor(id_arr_rgb, cv2.COLOR_RGB2BGR)
             ar_global = doc_w / float(doc_h + 1e-9)
-            dens = edge_density(bgr_full)
-            ar_ok   = 0.80 <= ar_global <= 2.50
-            dens_ok = 0.008 <= dens <= 0.30
-            ok = bool(doc_ok_face and ar_ok and dens_ok)
+            dens_edges = edge_density(bgr_full)
+            dens_text  = text_density_mser(bgr_full)
+
+            ar_ok   = AR_LOOSE_MIN <= ar_global <= AR_LOOSE_MAX
+            edges_ok= EDGE_DENS_MIN <= dens_edges <= EDGE_DENS_MAX
+            text_ok = TEXT_DENS_MIN <= dens_text  <= TEXT_DENS_MAX
+
+            # loose pasa si: (rostro pequeño + AR+edges) o (texto)
+            ok = bool( (doc_ok_face and ar_ok and edges_ok) or text_ok )
             meta_patch = {
                 "loose": True,
                 "ar_global": ar_global,
-                "edge_density": dens
+                "edge_density": dens_edges,
+                "text_density": dens_text,
+                "criteria": {
+                    "doc_ok_face": doc_ok_face,
+                    "ar_ok": ar_ok,
+                    "edges_ok": edges_ok,
+                    "text_ok": text_ok
+                }
             }
             return ok, meta_patch
 
