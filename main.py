@@ -1,4 +1,4 @@
-# main.py  (v1.6.0)
+# main.py  (v1.6.1)
 import io
 import os
 from typing import Dict, Tuple, List
@@ -15,17 +15,17 @@ import cv2
 # =========================
 # Config
 # =========================
-APP_VERSION           = "1.6.0"
+APP_VERSION           = "1.6.1"
 APP_DETECTOR_DEFAULT  = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
 DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
 DOC_MODE_DEFAULT      = "auto"       # auto (strict->loose) | strict | loose
 
-# Heurísticas de documento (ID card)
-CARD_MIN_AREA_FRAC    = 0.06
-CARD_MAX_AREA_FRAC    = 0.985
-CARD_AR_MIN           = 0.80
-CARD_AR_MAX           = 2.60
-CARD_ANGLE_TOL        = 40.0
+# Heurísticas de documento (ID card) - base
+CARD_MIN_AREA_FRAC_BASE = 0.06
+CARD_MAX_AREA_FRAC_BASE = 0.985
+CARD_AR_MIN_BASE        = 0.80
+CARD_AR_MAX_BASE        = 2.60
+CARD_ANGLE_TOL_BASE     = 40.0
 
 # Selfie / Face
 MIN_FACE_FRAC         = 0.12   # cara ≥12% del lado menor del frame
@@ -79,7 +79,7 @@ def _angle_cos(p0, p1, p2) -> float:
     d2 = p2 - p1
     return abs(np.dot(d1, d2) / (np.linalg.norm(d1) * np.linalg.norm(d2) + 1e-9))
 
-def _quad_is_rect_like(cnt: np.ndarray) -> bool:
+def _quad_is_rect_like(cnt: np.ndarray, angle_tol: float) -> bool:
     """¿Los 4 vértices forman un rectángulo (∼90° ± tolerancia)?"""
     pts = cnt.reshape(-1, 2).astype(np.float32)
     rect = cv2.convexHull(pts)
@@ -94,21 +94,25 @@ def _quad_is_rect_like(cnt: np.ndarray) -> bool:
         p2 = rect[(i + 1) % 4]
         cosang = _angle_cos(p0, p1, p2)
         ang = np.degrees(np.arccos(max(min(1.0 - 1e-6, 1.0 - cosang + 1e-6), -1.0 + 1e-6)))
-        if abs(90 - ang) > CARD_ANGLE_TOL:
+        if abs(90 - ang) > angle_tol:
             return False
     return True
 
 def _prep_edges(gray: np.ndarray) -> np.ndarray:
-    """Suaviza, cierra huecos y detecta bordes robustos."""
+    """Suaviza, mejora contraste, cierra huecos y detecta bordes robustos."""
     blur = cv2.GaussianBlur(gray, (5,5), 0)
+    # CLAHE para mejorar contraste en documentos “lavados”
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    eq = clahe.apply(blur)
     # morfología: close para “cerrar” el borde de la tarjeta
     kernel = np.ones((5,5), np.uint8)
-    closed = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, kernel, iterations=1)
+    closed = cv2.morphologyEx(eq, cv2.MORPH_CLOSE, kernel, iterations=1)
     edges = cv2.Canny(closed, 50, 150)
     edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
     return edges
 
-def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
+def detect_card_quad(bgr: np.ndarray, area_min_frac: float, area_max_frac: float,
+                     ar_min: float, ar_max: float, angle_tol: float) -> Tuple[bool, Dict]:
     """Detecta cuadrilátero grande tipo tarjeta/ID en la orientación dada."""
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -121,20 +125,20 @@ def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
     area_img = w * h
 
-    for c in cnts[:20]:
+    for c in cnts[:25]:
         area = cv2.contourArea(c)
         if area <= 1:
             continue
         frac = area / (area_img + 1e-9)
-        if frac < CARD_MIN_AREA_FRAC or frac > CARD_MAX_AREA_FRAC:
+        if frac < area_min_frac or frac > area_max_frac:
             continue
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.03 * peri, True)  # un poco más laxo
+        approx = cv2.approxPolyDP(c, 0.035 * peri, True)  # un poco más permisivo
         if len(approx) == 4:
             x, y, ww, hh = cv2.boundingRect(approx)
             ar = ww / float(hh + 1e-9)
-            rect_like = _quad_is_rect_like(approx)
-            if (CARD_AR_MIN <= ar <= CARD_AR_MAX) and rect_like:
+            rect_like = _quad_is_rect_like(approx, angle_tol)
+            if (ar_min <= ar <= ar_max) and rect_like:
                 return True, {"area_frac": frac, "ar": ar, "rect_like": True}
     return False, {"reason": "no_quad_like_card"}
 
@@ -153,7 +157,6 @@ def text_density_mser(bgr: np.ndarray) -> float:
     try:
         mser = cv2.MSER_create(_delta=5, _min_area=60, _max_area=5000)
     except TypeError:
-        # Firmas viejas de OpenCV
         mser = cv2.MSER_create()
 
     regions, _ = mser.detectRegions(gray)
@@ -161,30 +164,27 @@ def text_density_mser(bgr: np.ndarray) -> float:
 
     h, w = gray.shape[:2]
     area_img = float(h * w)
-    area_mser = 0.0
 
     for r in regions[:3000]:
         x, y, ww, hh = cv2.boundingRect(r.reshape(-1, 1, 2))
-        # filtritos rápidos para no contar ruido grande/rarísimo
         if ww * hh < 60 or ww * hh > 20000:
             continue
-        # relación de aspecto razonable para “cajas de texto”
         ar = ww / float(hh + 1e-9)
         if ar < 0.5 or ar > 12.0:
             continue
-        area_mser += ww * hh
         cv2.rectangle(mask, (x, y), (x + ww, y + hh), 255, -1)
 
     dens = float(np.count_nonzero(mask)) / (area_img + 1e-9)
     return dens
 
-def detect_card_any_rotation(img_rgb: np.ndarray):
+def detect_card_any_rotation(img_rgb: np.ndarray, area_min_frac: float, area_max_frac: float,
+                             ar_min: float, ar_max: float, angle_tol: float):
     """Prueba la heurística tarjeta a 0/90/180/270°. Devuelve (ok, meta) con meta['rotation']."""
     candidates = []
     for k in (0, 1, 2, 3):
         test_rgb = np.rot90(img_rgb, k=k) if k else img_rgb
         bgr = cv2.cvtColor(test_rgb, cv2.COLOR_RGB2BGR)
-        ok, meta = detect_card_quad(bgr)
+        ok, meta = detect_card_quad(bgr, area_min_frac, area_max_frac, ar_min, ar_max, angle_tol)
         meta = meta or {}
         meta['rotation'] = k * 90
         if ok:
@@ -249,16 +249,28 @@ async def health():
 
 @app.post("/why-doc")
 async def why_doc(
-    id_image: UploadFile = File(..., description="Imagen del documento (frontal)")
+    id_image: UploadFile = File(..., description="Imagen del documento (frontal)"),
+    relax: bool = Form(False)
 ):
     try:
+        # Ajustes según relax
+        CARD_MIN_AREA_FRAC = CARD_MIN_AREA_FRAC_BASE * (0.8 if relax else 1.0)
+        CARD_MAX_AREA_FRAC = CARD_MAX_AREA_FRAC_BASE
+        CARD_AR_MIN        = CARD_AR_MIN_BASE  - (0.05 if relax else 0.0)
+        CARD_AR_MAX        = CARD_AR_MAX_BASE  + (0.20 if relax else 0.0)
+        CARD_ANGLE_TOL     = CARD_ANGLE_TOL_BASE + (5.0 if relax else 0.0)
+
         id_bytes = await id_image.read()
         id_pil = auto_orient(Image.open(io.BytesIO(id_bytes)))
         id_pil = upscale_if_tiny(id_pil, 500)
         id_arr_rgb = pil_to_array(id_pil)
 
         # tarjeta rotation-aware
-        card_like, card_meta = detect_card_any_rotation(id_arr_rgb)
+        card_like, card_meta = detect_card_any_rotation(
+            id_arr_rgb,
+            CARD_MIN_AREA_FRAC, CARD_MAX_AREA_FRAC,
+            CARD_AR_MIN, CARD_AR_MAX, CARD_ANGLE_TOL
+        )
 
         # métricas globales
         bgr = cv2.cvtColor(id_arr_rgb, cv2.COLOR_RGB2BGR)
@@ -274,6 +286,7 @@ async def why_doc(
             "ar_global": ar_global,
             "edge_density": edens,
             "text_density": tdens,
+            "relax": bool(relax),
             "version": APP_VERSION
         }
     except Exception as e:
@@ -321,9 +334,19 @@ async def verify(
     threshold: float = Form(DEFAULT_THRESHOLD),
     detector:  str   = Form(APP_DETECTOR_DEFAULT),  # auto (default) | retinaface | opencv | ...
     enforce:   bool  = Form(True),
-    doc_mode:  str   = Form(DOC_MODE_DEFAULT)       # strict | loose | auto
+    doc_mode:  str   = Form(DOC_MODE_DEFAULT),      # strict | loose | auto
+    relax:     bool  = Form(False)                  # abre un poco las tolerancias del STRIC
 ) -> Dict:
     try:
+        # --------------------------
+        # Ajustes según relax
+        # --------------------------
+        CARD_MIN_AREA_FRAC = CARD_MIN_AREA_FRAC_BASE * (0.8 if relax else 1.0)
+        CARD_MAX_AREA_FRAC = CARD_MAX_AREA_FRAC_BASE
+        CARD_AR_MIN        = CARD_AR_MIN_BASE  - (0.05 if relax else 0.0)
+        CARD_AR_MAX        = CARD_AR_MAX_BASE  + (0.20 if relax else 0.0)
+        CARD_ANGLE_TOL     = CARD_ANGLE_TOL_BASE + (5.0 if relax else 0.0)
+
         # --------------------------
         # 1) Cargar imágenes + auto-orientación + upscale
         # --------------------------
@@ -342,7 +365,11 @@ async def verify(
         # --------------------------
         # 2) Validar DOCUMENTO (rotation-aware + heurística de tarjeta + rostro pequeño)
         # --------------------------
-        card_like, card_meta = detect_card_any_rotation(id_arr_rgb)
+        card_like, card_meta = detect_card_any_rotation(
+            id_arr_rgb,
+            CARD_MIN_AREA_FRAC, CARD_MAX_AREA_FRAC,
+            CARD_AR_MIN, CARD_AR_MAX, CARD_ANGLE_TOL
+        )
 
         # Detectar caras en doc
         doc_faces = []
@@ -364,14 +391,12 @@ async def verify(
                     fa = sorted(doc_faces, key=lambda d: d.get("confidence", 0), reverse=True)[0].get("facial_area", {})
                     fw, fh = fa.get("w", 0), fa.get("h", 0)
                     min_side = min(doc_w, doc_h)
-                    # pequeño => <= 45% del lado mínimo (un pelín más laxo)
-                    doc_ok_face = max(fw, fh) <= 0.45 * float(min_side)
+                    doc_ok_face = max(fw, fh) <= 0.45 * float(min_side)  # 45% del lado menor
                 except Exception:
                     doc_ok_face = True  # si no hay datos, no bloqueamos por aquí
 
         # ---- Decisión strict / loose / auto ----
         doc_mode_req = (doc_mode or DOC_MODE_DEFAULT).lower().strip()
-        doc_mode_used = "strict"  # default inicial
 
         def strict_decision() -> bool:
             return bool(card_like and doc_ok_face)
@@ -387,7 +412,6 @@ async def verify(
             edges_ok= EDGE_DENS_MIN <= dens_edges <= EDGE_DENS_MAX
             text_ok = TEXT_DENS_MIN <= dens_text  <= TEXT_DENS_MAX
 
-            # loose pasa si: (rostro pequeño + AR+edges) o (texto)
             ok = bool( (doc_ok_face and ar_ok and edges_ok) or text_ok )
             meta_patch = {
                 "loose": True,
@@ -403,22 +427,28 @@ async def verify(
             }
             return ok, meta_patch
 
+        doc_mode_used = None
+        loose_meta = None
+
         if doc_mode_req == "strict":
             doc_ok = strict_decision()
             doc_mode_used = "strict"
         elif doc_mode_req == "loose":
-            doc_ok, meta_patch = loose_decision()
+            doc_ok, loose_meta = loose_decision()
             doc_mode_used = "loose"
             if doc_ok:
-                card_meta = {**(card_meta or {}), **meta_patch}
+                card_meta = {**(card_meta or {}), **(loose_meta or {})}
         else:  # auto (strict → loose)
             doc_ok = strict_decision()
-            doc_mode_used = "strict"
-            if not doc_ok:
-                doc_ok, meta_patch = loose_decision()
+            if doc_ok:
+                doc_mode_used = "strict"
+            else:
+                doc_ok, loose_meta = loose_decision()
                 if doc_ok:
                     doc_mode_used = "loose"
-                    card_meta = {**(card_meta or {}), **meta_patch}
+                    card_meta = {**(card_meta or {}), **(loose_meta or {})}
+                else:
+                    doc_mode_used = "auto_failed"
 
         # --------------------------
         # 3) Validar SELFIE (exactamente 1 rostro, suficientemente grande)
@@ -458,7 +488,9 @@ async def verify(
                     "selfie": ("face_count!=1_or_too_small" if not selfie_ok else "ok")
                 },
                 "card_meta": card_meta,
+                "loose_meta": (loose_meta or {}),
                 "doc_mode_used": doc_mode_used,
+                "relax": bool(relax),
                 "version": APP_VERSION
             }
 
@@ -502,7 +534,9 @@ async def verify(
         ver["doc_ok"] = True
         ver["selfie_ok"] = True
         ver["card_meta"] = card_meta
+        ver["loose_meta"] = (loose_meta or {})
         ver["doc_mode_used"] = doc_mode_used
+        ver["relax"] = bool(relax)
         ver["version"] = APP_VERSION
         return ver
 
