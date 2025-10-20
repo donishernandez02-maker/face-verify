@@ -15,21 +15,23 @@ import cv2
 # =========================
 # Config
 # =========================
-APP_DETECTOR_DEFAULT = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
+APP_VERSION           = "1.5.0"
+APP_DETECTOR_DEFAULT  = "auto"       # auto | retinaface | opencv | mtcnn | ssd | yolov8 | mediapipe ...
 DEFAULT_THRESHOLD     = float(os.getenv("ARC_THRESHOLD", "0.38"))
+DOC_MODE_DEFAULT      = "auto"       # auto (strict->loose) | strict | loose
 
 # Heurísticas de documento (ID card) — relajadas para robustez
-CARD_MIN_AREA_FRAC    = 0.08   # antes 0.20
-CARD_MAX_AREA_FRAC    = 0.98   # antes 0.95
-CARD_AR_MIN           = 0.90   # antes 1.20
-CARD_AR_MAX           = 2.20   # antes 1.95
-CARD_ANGLE_TOL        = 35.0   # antes 25.0
+CARD_MIN_AREA_FRAC    = 0.08
+CARD_MAX_AREA_FRAC    = 0.98
+CARD_AR_MIN           = 0.90
+CARD_AR_MAX           = 2.20
+CARD_ANGLE_TOL        = 35.0
 
 # Selfie / Face
-MIN_FACE_FRAC         = 0.12   # cara debe ocupar al menos 12% del lado menor del frame
+MIN_FACE_FRAC         = 0.12   # cara ≥12% del lado menor del frame
 MAX_SELFIE_FACES      = 1      # exactamente una cara en selfie
 
-app = FastAPI(title="Face Verify API", version="1.4.0")
+app = FastAPI(title="Face Verify API", version=APP_VERSION)
 
 # CORS (útil para frontends)
 app.add_middleware(
@@ -49,7 +51,7 @@ def pil_to_array(img: Image.Image):
     return np.array(img)
 
 def auto_orient(pil_img: Image.Image) -> Image.Image:
-    """Corrige rotación según EXIF (fotos verticales)."""
+    """Corrige rotación según EXIF (verticales)."""
     try:
         return ImageOps.exif_transpose(pil_img)
     except Exception:
@@ -65,14 +67,12 @@ def upscale_if_tiny(pil_img: Image.Image, min_side_target: int = 500) -> Image.I
     return pil_img
 
 def _angle_cos(p0, p1, p2) -> float:
-    # cos del ángulo en p1 (entre p0->p1 y p2->p1)
     d1 = p0 - p1
     d2 = p2 - p1
-    cosang = abs(np.dot(d1, d2) / (np.linalg.norm(d1) * np.linalg.norm(d2) + 1e-9))
-    return cosang
+    return abs(np.dot(d1, d2) / (np.linalg.norm(d1) * np.linalg.norm(d2) + 1e-9))
 
 def _quad_is_rect_like(cnt: np.ndarray) -> bool:
-    """Aproxima si los 4 vértices forman un rectángulo (ángulos ~90° con tolerancia)."""
+    """¿Los 4 vértices forman un rectángulo (∼90° ± tolerancia)?"""
     pts = cnt.reshape(-1, 2).astype(np.float32)
     rect = cv2.convexHull(pts)
     if len(rect) != 4:
@@ -84,15 +84,14 @@ def _quad_is_rect_like(cnt: np.ndarray) -> bool:
         p0 = rect[(i - 1) % 4]
         p1 = rect[i]
         p2 = rect[(i + 1) % 4]
-        cosang = _angle_cos(p0, p1, p2)  # 0 ideal
-        # convertir a grados (heurístico estable)
+        cosang = _angle_cos(p0, p1, p2)
         ang = np.degrees(np.arccos(max(min(1.0 - 1e-6, 1.0 - cosang + 1e-6), -1.0 + 1e-6)))
         if abs(90 - ang) > CARD_ANGLE_TOL:
             return False
     return True
 
 def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
-    """Detecta si hay un cuadrilátero grande tipo tarjeta/ID en orientación dada."""
+    """Detecta cuadrilátero grande tipo tarjeta/ID en la orientación dada."""
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5,5), 0)
@@ -100,7 +99,7 @@ def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
     edges = cv2.Canny(gray, 50, 150)
     edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
 
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CAIN_APPROX_SIMPLE) if hasattr(cv2, "CAIN_APPROX_SIMPLE") else cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return False, {"reason": "no_contours"}
 
@@ -131,12 +130,9 @@ def edge_density(bgr: np.ndarray) -> float:
     return float(np.count_nonzero(e)) / float(h * w + 1e-9)
 
 def detect_card_any_rotation(img_rgb: np.ndarray):
-    """
-    Prueba la heurística de tarjeta a 0°, 90°, 180°, 270°.
-    Devuelve (ok, meta) y meta['rotation'] en grados.
-    """
+    """Prueba la heurística tarjeta a 0/90/180/270°. Devuelve (ok, meta) con meta['rotation']."""
     candidates = []
-    for k in (0, 1, 2, 3):  # rotaciones 0/90/180/270
+    for k in (0, 1, 2, 3):
         test_rgb = np.rot90(img_rgb, k=k) if k else img_rgb
         bgr = cv2.cvtColor(test_rgb, cv2.COLOR_RGB2BGR)
         ok, meta = detect_card_quad(bgr)
@@ -149,14 +145,10 @@ def detect_card_any_rotation(img_rgb: np.ndarray):
     return False, best
 
 def extract_faces(img_rgb: np.ndarray, backend: str) -> List[dict]:
-    """
-    DeepFace.extract_faces devuelve lista de dicts: { "face": np.ndarray, "facial_area": {...}, "confidence": ... }
-    """
-    faces = DeepFace.extract_faces(img_path=img_rgb, detector_backend=backend, enforce_detection=False)
-    return faces
+    """DeepFace.extract_faces → lista de dicts."""
+    return DeepFace.extract_faces(img_path=img_rgb, detector_backend=backend, enforce_detection=False)
 
 def pick_best_face(faces: List[dict], prefer_larger: bool = True) -> np.ndarray:
-    """Escoge la cara más grande o de mayor confianza."""
     if not faces:
         return None
     if prefer_larger:
@@ -176,7 +168,7 @@ def pick_best_face(faces: List[dict], prefer_larger: bool = True) -> np.ndarray:
     return None
 
 def do_verify(id_arr, sf_arr, threshold: float, detector: str, enforce: bool) -> Tuple[dict, dict]:
-    """Ejecuta DeepFace.verify con parámetros dados. Devuelve (payload, meta)."""
+    """DeepFace.verify con parámetros dados."""
     result = DeepFace.verify(
         img1_path=id_arr,
         img2_path=sf_arr,
@@ -204,7 +196,7 @@ def do_verify(id_arr, sf_arr, threshold: float, detector: str, enforce: bool) ->
 # =========================
 @app.get("/health")
 async def health():
-    return {"ok": True, "status": "healthy"}
+    return {"ok": True, "status": "healthy", "version": APP_VERSION}
 
 @app.post("/debug")
 async def debug_uploads(
@@ -222,7 +214,7 @@ async def debug_uploads(
         try:
             id_pil = Image.open(io.BytesIO(id_bytes))
             info["id_image"]["format"] = id_pil.format
-            info["id_image"]["size"]   = id_pil.size  # (w, h)
+            info["id_image"]["size"]   = id_pil.size
             info["id_image"]["mode"]   = id_pil.mode
         except UnidentifiedImageError as e:
             info["id_image"]["error"] = f"PIL: {str(e)}"
@@ -247,7 +239,8 @@ async def verify(
     selfie:   UploadFile = File(..., description="Selfie a validar"),
     threshold: float = Form(DEFAULT_THRESHOLD),
     detector:  str   = Form(APP_DETECTOR_DEFAULT),  # auto (default) | retinaface | opencv | ...
-    enforce:   bool  = Form(True)                   # aplica si detector != auto
+    enforce:   bool  = Form(True),
+    doc_mode:  str   = Form(DOC_MODE_DEFAULT)       # strict | loose | auto
 ) -> Dict:
     try:
         # --------------------------
@@ -268,7 +261,6 @@ async def verify(
         # --------------------------
         # 2) Validar DOCUMENTO (rotation-aware + heurística de tarjeta + rostro pequeño)
         # --------------------------
-        # Intento con rotaciones para admitir fotos en vertical
         card_like, card_meta = detect_card_any_rotation(id_arr_rgb)
 
         # Detectar caras en doc
@@ -281,7 +273,7 @@ async def verify(
             except Exception:
                 doc_faces = []
 
-        # cara “pequeña” en doc (respecto al frame)
+        # cara “pequeña” en doc
         doc_h, doc_w = id_arr_rgb.shape[:2]
         doc_ok_face = False
         if doc_faces:
@@ -291,32 +283,48 @@ async def verify(
                     fa = sorted(doc_faces, key=lambda d: d.get("confidence", 0), reverse=True)[0].get("facial_area", {})
                     fw, fh = fa.get("w", 0), fa.get("h", 0)
                     min_side = min(doc_w, doc_h)
-                    # pequeño => <= 40% del lado mínimo (heurística)
                     doc_ok_face = max(fw, fh) <= 0.40 * float(min_side)
                 except Exception:
                     doc_ok_face = True  # si no hay datos, no bloqueamos
 
-        # Decisión estricta primero
-        doc_ok = bool(card_like and doc_ok_face)
-        doc_mode_used = "strict"
+        # ---- Decisión strict / loose / auto ----
+        doc_mode_req = (doc_mode or DOC_MODE_DEFAULT).lower().strip()
+        doc_mode_used = "strict"  # default inicial
 
-        # --- Fallback automático a 'loose' si strict falla ---
-        if not doc_ok:
+        def strict_decision() -> bool:
+            return bool(card_like and doc_ok_face)
+
+        def loose_decision() -> Tuple[bool, Dict]:
+            # Señales globales: AR + densidad de bordes
             bgr_full = cv2.cvtColor(id_arr_rgb, cv2.COLOR_RGB2BGR)
             ar_global = doc_w / float(doc_h + 1e-9)
             dens = edge_density(bgr_full)
-            # rangos amplios pensados para ID en vertical/horizontal y escenas reales
             ar_ok   = 0.80 <= ar_global <= 2.50
             dens_ok = 0.008 <= dens <= 0.30
-            if doc_ok_face and ar_ok and dens_ok:
-                doc_ok = True
-                doc_mode_used = "loose"
-                card_meta = {
-                    **(card_meta or {}),
-                    "loose": True,
-                    "ar_global": ar_global,
-                    "edge_density": dens
-                }
+            ok = bool(doc_ok_face and ar_ok and dens_ok)
+            meta_patch = {
+                "loose": True,
+                "ar_global": ar_global,
+                "edge_density": dens
+            }
+            return ok, meta_patch
+
+        if doc_mode_req == "strict":
+            doc_ok = strict_decision()
+            doc_mode_used = "strict"
+        elif doc_mode_req == "loose":
+            doc_ok, meta_patch = loose_decision()
+            doc_mode_used = "loose"
+            if doc_ok:
+                card_meta = {**(card_meta or {}), **meta_patch}
+        else:  # auto (strict → loose)
+            doc_ok = strict_decision()
+            doc_mode_used = "strict"
+            if not doc_ok:
+                doc_ok, meta_patch = loose_decision()
+                if doc_ok:
+                    doc_mode_used = "loose"
+                    card_meta = {**(card_meta or {}), **meta_patch}
 
         # --------------------------
         # 3) Validar SELFIE (exactamente 1 rostro, suficientemente grande)
@@ -345,7 +353,7 @@ async def verify(
                 min_side = float(min(sw, sh))
                 selfie_ok = max(fw, fh) >= MIN_FACE_FRAC * min_side
 
-        # Si no cumple, rechazamos con razón clara
+        # Si falla doc o selfie, responder claro
         if not doc_ok or not selfie_ok:
             return {
                 "ok": False,
@@ -356,21 +364,20 @@ async def verify(
                     "selfie": ("face_count!=1_or_too_small" if not selfie_ok else "ok")
                 },
                 "card_meta": card_meta,
-                "doc_mode_used": doc_mode_used
+                "doc_mode_used": doc_mode_used,
+                "version": APP_VERSION
             }
 
         # --------------------------
         # 4) Comparación biométrica (match)
-        #    - Recortamos rostro del doc y rostro de la selfie
         # --------------------------
         doc_face_img = pick_best_face(doc_faces, prefer_larger=False)
         if doc_face_img is None or selfie_face_img is None:
-            return {"ok": False, "reason": "face_crop_failed", "doc_mode_used": doc_mode_used}
+            return {"ok": False, "reason": "face_crop_failed", "doc_mode_used": doc_mode_used, "version": APP_VERSION}
 
         id_face_arr = np.array(doc_face_img)
         sf_face_arr = np.array(selfie_face_img)
 
-        # 4.a) modo auto (retinaface + fallback a opencv)
         def verify_auto(x1, x2, thr):
             try:
                 payload, _ = do_verify(x1, x2, thr, detector="retinaface", enforce=True)
@@ -389,7 +396,7 @@ async def verify(
                 except Exception as e2:
                     return {"ok": False, "error": f"FallbackError: {type(e1).__name__} -> {type(e2).__name__}"}
 
-        if detector.lower() == "auto":
+        if (detector or "auto").lower() == "auto":
             ver = verify_auto(id_face_arr, sf_face_arr, threshold)
         else:
             try:
@@ -398,18 +405,17 @@ async def verify(
             except Exception as e:
                 ver = {"ok": False, "error": f"{type(e).__name__}: {str(e)}"}
 
-        # empaquetar estado de validaciones previas
         ver["doc_ok"] = True
         ver["selfie_ok"] = True
         ver["card_meta"] = card_meta
         ver["doc_mode_used"] = doc_mode_used
+        ver["version"] = APP_VERSION
         return ver
 
     except Exception as e:
-        # no tiramos 500 para facilitar manejo en el cliente
         return JSONResponse(
             status_code=200,
-            content={"ok": False, "error": f"{type(e).__name__}: {str(e)}"}
+            content={"ok": False, "error": f"{type(e).__name__}: {str(e)}", "version": APP_VERSION}
         )
 
 # Local dev
