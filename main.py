@@ -1,4 +1,4 @@
-# main.py — Face Verify API (v1.7.1)
+# main.py — Face Verify API (v1.8.0)
 import io
 import os
 from typing import Dict, Tuple, Optional
@@ -16,7 +16,7 @@ import cv2
 # =========================
 # Config & Constantes
 # =========================
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 
 # Detector por defecto para DeepFace
 APP_DETECTOR_DEFAULT = os.getenv("DETECTOR_DEFAULT", "opencv")
@@ -99,6 +99,18 @@ def rotate_image(img: np.ndarray, rot: int) -> np.ndarray:
         return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return img
 
+def rotate_image_bound(img: np.ndarray, angle: float) -> np.ndarray:
+    """Rota manteniendo contenido completo (no recorta)."""
+    (h, w) = img.shape[:2]
+    center = (w / 2, h / 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = abs(M[0, 0]); sin = abs(M[1, 0])
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    M[0, 2] += (nW / 2) - center[0]
+    M[1, 2] += (nH / 2) - center[1]
+    return cv2.warpAffine(img, M, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
 # =========================
 # Métricas heurísticas (doc)
 # =========================
@@ -114,18 +126,17 @@ def text_like_density(gray: np.ndarray) -> float:
     Normalizamos por el área; no es OCR, solo textura fina tipo caracteres.
     """
     h, w = gray.shape[:2]
-    # realzar bordes finos
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY_INV, 25, 5)
+    th = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 25, 5
+    )
     cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     areas = [cv2.contourArea(c) for c in cnts]
-    # contar “granos” (descarta muy grandes y muy minúsculos)
     h_area = h * w
     useful = [a for a in areas if (h_area * 0.00002) < a < (h_area * 0.005)]
-    dens = len(useful) / (h * w / 10000.0)  # normaliza por “bloques”
-    # acotar a [0,1] approx
-    dens = min(1.0, dens / 50.0)
+    dens = len(useful) / (h * w / 10000.0)  # normaliza
+    dens = min(1.0, dens / 50.0)  # acotar aprox [0,1]
     return float(dens)
 
 def aspect_ratio_h_over_w(img: np.ndarray) -> float:
@@ -140,7 +151,6 @@ def find_quad_like_card(img: np.ndarray) -> Tuple[bool, dict]:
     gray = to_gray(img)
     v = max(50, int(np.median(gray) * 0.66))
     edges = cv2.Canny(gray, v, v * 2)
-    # dilatar un poco bordes para cerrar huecos
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
     cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -156,7 +166,6 @@ def find_quad_like_card(img: np.ndarray) -> Tuple[bool, dict]:
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
-            # bounding rect y ar
             x, y, cw, ch = cv2.boundingRect(approx)
             ar_hw = ch / float(cw) if cw > 0 else 0.0
             if 0.5 <= ar_hw <= 0.8 or 0.5 <= (1.0 / max(1e-6, ar_hw)) <= 0.8:
@@ -164,9 +173,7 @@ def find_quad_like_card(img: np.ndarray) -> Tuple[bool, dict]:
     return False, {"reason": "no_quad_like_card"}
 
 def compute_doc_metrics(img: np.ndarray) -> Tuple[dict, dict]:
-    """
-    Calcula métricas globales y del center-crop.
-    """
+    """Calcula métricas globales y del center-crop."""
     gray = to_gray(img)
     ar_g = aspect_ratio_h_over_w(img)
     e_g = edge_density(gray)
@@ -208,22 +215,17 @@ def evaluate_doc_checks(metrics_global: dict,
     e_c = metrics_center["edge_density"]
     t_c = metrics_center["text_density"]
 
-    # Global: edges bajos - medios, poco texto global
     edges_ok_g = (EDGE_DENS_MIN_G <= e_g <= edge_cap_global)
     text_ok_g = (t_g <= TEXT_DENS_MAX_G)
 
-    # Center: texto moderado (no excesivo), con mínimo de “detalle”
     text_ok_c = (TEXT_DENS_MIN_C <= t_c <= text_cap_center)
     edges_ok_c = True  # no rígido en center
 
-    # AR solo si no se ignora
     ar_ok_g = True if ignore_ar else (AR_MIN <= ar_g <= AR_MAX)
     ar_ok_c = True if ignore_ar else (AR_MIN <= ar_c <= AR_MAX)
 
-    # require cuadrilátero si se pide
     quad_ok = (True if not require_quad else quad_like)
 
-    # Decisión: combinación razonable
     doc_ok = (quad_ok and edges_ok_g and text_ok_g and text_ok_c and ar_ok_g and ar_ok_c)
 
     checks_global = {
@@ -257,7 +259,6 @@ def best_rotation_card(img: np.ndarray) -> Tuple[np.ndarray, dict]:
             meta_out.update(meta)
             return rr, meta_out
         tried.append(meta.get("reason", "no_card"))
-    # Si ninguna rotación dio, devolvemos rot=0
     return img, {"reason": tried[-1] if tried else "no_quad_like_card", "rotation": 0}
 
 def deepface_single_face(img: np.ndarray, detector_backend: str = "opencv") -> Tuple[bool, dict]:
@@ -271,7 +272,6 @@ def deepface_single_face(img: np.ndarray, detector_backend: str = "opencv") -> T
         dets = []
     if len(dets) != 1:
         return False, {"reason": "face_count", "count": len(dets)}
-    # área relativa aproximada
     fa = dets[0].get("facial_area") or dets[0].get("region") or {}
     h, w = img.shape[:2]
     area_ratio = float(fa.get("h", 0)) / float(h if h else 1)
@@ -295,19 +295,16 @@ def check_document_like(img: np.ndarray,
       - strict_meta (dict)
       - doc_face_reason (str)
     """
-    # 1) Mejor rotación con forma de tarjeta
     rotated, card_meta = best_rotation_card(img)
 
-    # 2) Métricas global / center
     mg, mc = compute_doc_metrics(rotated)
     used_center = False
     if use_center_crop:
-        _ = center_crop(rotated, CENTER_CROP_F)  # solo para trazabilidad si quisieras re-medir
+        _ = center_crop(rotated, CENTER_CROP_F)
         used_center = True
 
     quad_like = (card_meta.get("reason") == "ok")
 
-    # 3) Decisión loose (bordes/text/AR)
     loose_ok, checks_g, checks_c = evaluate_doc_checks(
         mg, mc,
         require_quad=require_quad,
@@ -317,11 +314,9 @@ def check_document_like(img: np.ndarray,
         quad_like=quad_like
     )
 
-    # 4) Presencia de 1 rostro en el documento
+    # Para strict, exigimos 1 rostro en doc (usando detector por defecto)
     doc_face_ok, face_meta = deepface_single_face(rotated, detector_backend=APP_DETECTOR_DEFAULT)
 
-    # 5) Decisiones finales por modo
-    # strict: SOLO quad_like + 1 rostro (sin edges/text/AR)
     strict_decision = (quad_like and doc_face_ok)
     strict_meta = {
         "strict_card_like": bool(quad_like),
@@ -342,6 +337,42 @@ def check_document_like(img: np.ndarray,
     # auto = strict
     return strict_decision, card_meta, loose_meta, strict_meta, ("" if strict_decision else doc_face_reason)
 
+# =========================
+# Face crops helpers (nuevo)
+# =========================
+def extract_single_face_np(img_rgb: np.ndarray, detector_backend: str):
+    """
+    Devuelve (face_rgb_uint8, meta) o (None, {'reason': ...})
+    """
+    try:
+        faces = DeepFace.extract_faces(
+            img_path=img_rgb,
+            detector_backend=detector_backend,
+            enforce_detection=True,
+            align=True
+        )
+    except Exception as e:
+        return None, {"reason": type(e).__name__}
+
+    if not faces:
+        return None, {"reason": "face_count", "count": 0}
+
+    # elegir la cara más grande
+    best = max(
+        faces,
+        key=lambda f: (f.get("facial_area", {}).get("w", 0) * f.get("facial_area", {}).get("h", 0))
+    )
+    face = best.get("face")
+    fa = best.get("facial_area", {})
+    if face is None:
+        return None, {"reason": "no_face_crop"}
+
+    # DeepFace devuelve face en RGB [0..1]
+    if face.dtype != np.uint8:
+        face = (np.clip(face, 0, 1) * 255).astype("uint8")
+
+    meta = {"reason": "ok", "bbox": [fa.get("x"), fa.get("y"), fa.get("w"), fa.get("h")]}
+    return face, meta
 
 # =========================
 # Selfie helpers
@@ -461,10 +492,9 @@ async def why_doc(
         if use_center_crop:
             cc = center_crop(rotated, CENTER_CROP_F)
             mg_c, mc_c = compute_doc_metrics(cc)
-            # Re-evaluación indicativa sobre el center-crop
             _, _, checks_center = evaluate_doc_checks(
                 mg_c, mc_c,
-                require_quad=False,  # en crop no exigimos quad
+                require_quad=False,
                 ignore_ar=ignore_ar,
                 text_cap_center=text_max_center,
                 edge_cap_global=edge_max_global,
@@ -517,7 +547,7 @@ async def verify(
     Flujo completo:
     1) Validar documento (card-like + métricas + 1 rostro).
     2) Validar selfie (1 rostro y tamaño mínimo relativo al alto).
-    3) Si ambos ok, comparar biometría (ArcFace).
+    3) Si ambos ok, comparar biometría (ArcFace) sobre CROPS de rostro.
     """
     try:
         # Leer imágenes
@@ -541,16 +571,14 @@ async def verify(
             edge_max_global=edge_max_global,
         )
 
-        # 2) Selfie
+        # 2) Selfie (detección básica + ratio y opcional crop ajustado)
         s_ok, s_meta, face_img = detect_face_and_ratio(
             sf_arr,
             detector_backend=detector,
             tight_crop=auto_tight_crop
         )
+        selfie_card_like = False  # no se valida card-like en selfie
 
-        selfie_card_like = False  # no verificamos “card-like” en selfie
-
-        # Conteo de caras
         if not s_ok:
             return {
                 "ok": False,
@@ -569,7 +597,6 @@ async def verify(
                 "selfie_meta": s_meta,
             }
 
-        # Tamaño mínimo de cara
         area_ratio = float(s_meta.get("area_ratio", 0.0))
         if area_ratio < float(min_face_ratio_selfie):
             return {
@@ -608,36 +635,63 @@ async def verify(
                 "selfie_meta": s_meta,
             }
 
-        # 3) Verificación biométrica
-        selfie_for_compare = face_img if (auto_tight_crop and face_img is not None) else sf_arr
+        # =========================
+        # 3) Verificación biométrica — comparar CARA vs CARA
+        # =========================
 
-        used_detector = detector
-        fallback_used = False
-        note = ""
-        try:
-            result = DeepFace.verify(
-                img1_path=id_arr,
-                img2_path=selfie_for_compare,
-                model_name="ArcFace",
-                detector_backend=used_detector,
-                distance_metric="cosine",
-                enforce_detection=enforce
-            )
-        except Exception as e:
-            # Fallback a opencv
-            note = f"{used_detector} failed: {type(e).__name__}"
-            used_detector = "opencv"
-            fallback_used = True
-            result = DeepFace.verify(
-                img1_path=id_arr,
-                img2_path=selfie_for_compare,
-                model_name="ArcFace",
-                detector_backend=used_detector,
-                distance_metric="cosine",
-                enforce_detection=False
-            )
+        # 3.a rotar doc si card_meta trae rotación (usar rotate bound para conservar contenido)
+        rotation = float(card_meta.get("rotation", 0.0)) if isinstance(card_meta, dict) else 0.0
+        doc_for_face = id_arr
+        if abs(rotation) > 1e-3:
+            # convertir a BGR -> rotar -> volver a RGB
+            doc_bgr = cv2.cvtColor(id_arr, cv2.COLOR_RGB2BGR)
+            doc_bgr = rotate_image_bound(doc_bgr, rotation)
+            doc_for_face = cv2.cvtColor(doc_bgr, cv2.COLOR_BGR2RGB)
 
-        dist = float(result.get("distance", 1.0))
+        # 3.b extraer UNA cara del doc y de la selfie (con el MISMO detector)
+        doc_face, doc_meta_face = extract_single_face_np(doc_for_face, detector_backend=detector)
+        if face_img is not None:
+            selfie_face = face_img
+            selfie_meta_face = {"reason": "ok", "bbox": None, "from_tight_crop": True}
+        else:
+            selfie_face, selfie_meta_face = extract_single_face_np(sf_arr, detector_backend=detector)
+
+        if doc_face is None or selfie_face is None:
+            # Falla de extracción de cara en doc o selfie (caso extremo)
+            reason = {
+                "doc": ("doc_face_" + doc_meta_face.get("reason", "fail")) if doc_face is None else "ok",
+                "selfie": ("selfie_face_" + selfie_meta_face.get("reason", "fail")) if selfie_face is None else "ok",
+            }
+            return {
+                "ok": False,
+                "doc_ok": True,
+                "selfie_ok": True,
+                "reason": reason,
+                "selfie_card_like": selfie_card_like,
+                "card_meta": card_meta,
+                "loose_meta": loose_meta,
+                "strict_meta": strict_meta,
+                "doc_face_reason": reason["doc"],
+                "doc_mode_used": ("auto_failed" if (doc_mode == "auto" and not doc_ok) else doc_mode),
+                "relax": bool(ignore_ar),
+                "use_center_crop": bool(use_center_crop),
+                "version": APP_VERSION,
+                "selfie_meta": s_meta,
+                "compare_source": "face_crops",
+                "doc_face_bbox": doc_meta_face.get("bbox") if isinstance(doc_meta_face, dict) else None,
+                "selfie_face_bbox": selfie_meta_face.get("bbox") if isinstance(selfie_meta_face, dict) else None,
+            }
+
+        # 3.c comparar SOLO las caras (saltando re-detección)
+        vr = DeepFace.verify(
+            img1_path=doc_face,
+            img2_path=selfie_face,
+            model_name="ArcFace",
+            detector_backend="skip",     # clave: no re-detecta
+            distance_metric="cosine",
+            enforce_detection=False
+        )
+        dist = float(vr.get("distance", 1.0))
         verified = dist <= float(threshold)
 
         return {
@@ -646,10 +700,10 @@ async def verify(
             "distance": dist,
             "threshold": float(threshold),
             "model": "ArcFace",
-            "detector": used_detector,
+            "detector": detector,
             "enforce": bool(enforce),
-            "fallback_used": bool(fallback_used),
-            "note": note if fallback_used else "",
+            "fallback_used": False,
+            "note": "",
 
             "doc_ok": True,
             "selfie_ok": True,
@@ -661,6 +715,11 @@ async def verify(
             "use_center_crop": bool(use_center_crop),
             "version": APP_VERSION,
             "selfie_meta": {"reason": "ok", "area_ratio": area_ratio, "tight_crop": bool(auto_tight_crop)},
+
+            # nuevos campos de debug de comparación
+            "compare_source": "face_crops",
+            "doc_face_bbox": doc_meta_face.get("bbox"),
+            "selfie_face_bbox": selfie_meta_face.get("bbox"),
         }
 
     except Exception as e:
