@@ -7,3 +7,4 @@ onnxruntime
 numpy
 Pillow
 tf-keras
+python-multipart
