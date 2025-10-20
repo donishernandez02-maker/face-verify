@@ -1,10 +1,16 @@
-fastapi
-uvicorn[standard]
-deepface
-opencv-python-headless
-retina-face
-onnxruntime
-numpy
-Pillow
-tf-keras
-python-multipart
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# DeepFace + modelos/detectores
+deepface==0.0.93
+retina-face==0.0.14
+tf-keras==2.20.0
+
+# Dependencias de imagen/inferencia
+opencv-python-headless==4.10.0.84
+onnxruntime==1.18.1
+numpy==1.26.4
+Pillow==10.4.0
+
+# Uploads multipart para FastAPI
+python-multipart==0.0.9
