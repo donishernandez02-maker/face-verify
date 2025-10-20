@@ -1,4 +1,4 @@
-# main.py — Face Verify API (v1.9.0)
+# main.py — Face Verify API (v1.9.1)
 import io
 import os
 from typing import Dict, Tuple, Optional, List
@@ -14,12 +14,12 @@ import cv2  # OpenCV: bordes / contornos / utilidades
 # =========================
 # Config & Constantes
 # =========================
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 # Detector por defecto para DeepFace
 APP_DETECTOR_DEFAULT = os.getenv("DETECTOR_DEFAULT", "opencv")
 
-# Umbral biométrico por defecto (cosine distance para ArcFace)
+# Umbral biométrico (ya no se usa para comparación, pero lo dejamos por compatibilidad)
 DEFAULT_THRESHOLD = float(os.getenv("ARC_THRESHOLD", "0.38"))
 
 # Límites heurísticos de documento (tuneables por env)
@@ -264,7 +264,7 @@ def check_document_like(img: np.ndarray,
     return strict_decision, card_meta, loose_meta, strict_meta, ("" if strict_decision else doc_face_reason)
 
 # =========================
-# Face crops helpers
+# Face crops helpers (quedan por compatibilidad; no se usan en comparación)
 # =========================
 def _pad_bbox(x: int, y: int, w: int, h: int, W: int, H: int, pad_ratio: float):
     px = int(w * pad_ratio); py = int(h * pad_ratio)
@@ -273,9 +273,6 @@ def _pad_bbox(x: int, y: int, w: int, h: int, W: int, H: int, pad_ratio: float):
     return x2, y2, max(1, x3 - x2), max(1, y3 - y2)
 
 def extract_single_face_np(img_rgb: np.ndarray, detector_backend: str):
-    """
-    Devuelve (face_rgb_uint8, meta) o (None, {'reason': ...})
-    """
     try:
         faces = DeepFace.extract_faces(
             img_path=img_rgb,
@@ -285,22 +282,17 @@ def extract_single_face_np(img_rgb: np.ndarray, detector_backend: str):
         )
     except Exception as e:
         return None, {"reason": type(e).__name__}
-
     if not faces:
         return None, {"reason": "face_count", "count": 0}
-
     best = max(
         faces,
         key=lambda f: (f.get("facial_area", {}).get("w", 0) * f.get("facial_area", {}).get("h", 0))
     )
-    face = best.get("face")
-    fa = best.get("facial_area", {})
+    face = best.get("face"); fa = best.get("facial_area", {})
     if face is None:
         return None, {"reason": "no_face_crop"}
-
     if face.dtype != np.uint8:
         face = (np.clip(face, 0, 1) * 255).astype("uint8")
-
     meta = {"reason": "ok", "bbox": [fa.get("x"), fa.get("y"), fa.get("w"), fa.get("h")]}
     return face, meta
 
@@ -312,7 +304,6 @@ def detect_face_and_ratio(img: np.ndarray, detector_backend: str = "opencv",
     """
     -> (ok, meta, face_img, bbox)
     meta: {"reason": "ok"|"face_count"|"face_too_small", "area_ratio": float, "count": int}
-    bbox: (x, y, w, h) del recorte usado (con padding si tight_crop=True)
     """
     try:
         detections = DeepFace.extract_faces(
@@ -445,7 +436,7 @@ async def why_selfie(
 async def verify(
     id_image: UploadFile = File(..., description="Imagen del documento (frontal)"),
     selfie: UploadFile = File(..., description="Selfie a validar"),
-    threshold: float = Form(DEFAULT_THRESHOLD),
+    threshold: float = Form(DEFAULT_THRESHOLD),  # ignorado, queda por compatibilidad
 
     # Documento
     use_center_crop: bool = Form(False),
@@ -457,20 +448,17 @@ async def verify(
 
     # Detector + DeepFace
     detector: str = Form(APP_DETECTOR_DEFAULT),
-    enforce: bool = Form(False),
+    enforce: bool = Form(False),        # ignorado en este flujo
 
     # Selfie params
     min_face_ratio_selfie: float = Form(MIN_FACE_RATIO_DEFAULT),
-    auto_tight_crop: bool = Form(False),
-
-    # Modelo primario (opcional) para verificación
-    model_name: str = Form("ArcFace"),
+    auto_tight_crop: bool = Form(False),  # ignorado en este flujo (no comparamos)
 ) -> Dict:
     """
-    Flujo completo:
+    Flujo nuevo (sin biometría):
     1) Validar documento (card-like + métricas + 1 rostro).
     2) Validar selfie (1 rostro y tamaño mínimo relativo al alto).
-    3) Comparar biometría sobre CROPS de rostro con padding/alineación y fallback multi-modelo.
+    3) Si ambos OK -> éxito; no se realiza comparación rostro vs rostro.
     """
     try:
         # Leer imágenes
@@ -494,11 +482,13 @@ async def verify(
             edge_max_global=edge_max_global,
         )
 
-        # 2) Selfie
-        s_ok, s_meta, face_img, selfie_bbox = detect_face_and_ratio(
-            sf_arr, detector_backend=detector, tight_crop=auto_tight_crop
+        # 2) Selfie (detección + ratio)
+        s_ok, s_meta, _, _ = detect_face_and_ratio(
+            sf_arr,
+            detector_backend=detector,
+            tight_crop=False
         )
-        selfie_card_like = False
+        selfie_card_like = False  # no se valida card-like en selfie
 
         if not s_ok:
             return {
@@ -516,6 +506,7 @@ async def verify(
                 "use_center_crop": bool(use_center_crop),
                 "version": APP_VERSION,
                 "selfie_meta": s_meta,
+                "biometric_skipped": True,
             }
 
         area_ratio = float(s_meta.get("area_ratio", 0.0))
@@ -535,9 +526,10 @@ async def verify(
                 "use_center_crop": bool(use_center_crop),
                 "version": APP_VERSION,
                 "selfie_meta": {"reason": "face_too_small", "area_ratio": area_ratio},
+                "biometric_skipped": True,
             }
 
-        # Si documento NO pasó, cortamos aquí
+        # Si documento NO pasó
         if not doc_ok:
             return {
                 "ok": False,
@@ -554,94 +546,16 @@ async def verify(
                 "use_center_crop": bool(use_center_crop),
                 "version": APP_VERSION,
                 "selfie_meta": s_meta,
+                "biometric_skipped": True,
             }
 
-        # =========================
-        # 3) Verificación biométrica — comparar CARA vs CARA con fallback multi-modelo
-        # =========================
-
-        # 3.a rotar doc según meta
-        rotation = float(card_meta.get("rotation", 0.0)) if isinstance(card_meta, dict) else 0.0
-        doc_for_face = id_arr
-        if abs(rotation) > 1e-3:
-            doc_bgr = cv2.cvtColor(id_arr, cv2.COLOR_RGB2BGR)
-            doc_bgr = rotate_image_bound(doc_bgr, rotation)
-            doc_for_face = cv2.cvtColor(doc_bgr, cv2.COLOR_BGR2RGB)
-
-        # 3.b extraer cara del doc y de la selfie (con MISMO detector)
-        doc_face, doc_meta_face = extract_single_face_np(doc_for_face, detector_backend=detector)
-        if face_img is not None:
-            selfie_face = face_img
-            selfie_meta_face = {"reason": "ok", "bbox": list(selfie_bbox) if selfie_bbox else None, "from_tight_crop": True}
-        else:
-            selfie_face, selfie_meta_face = extract_single_face_np(sf_arr, detector_backend=detector)
-
-        if doc_face is None or selfie_face is None:
-            reason = {
-                "doc": ("doc_face_" + doc_meta_face.get("reason", "fail")) if doc_face is None else "ok",
-                "selfie": ("selfie_face_" + selfie_meta_face.get("reason", "fail")) if selfie_face is None else "ok",
-            }
-            return {
-                "ok": False,
-                "doc_ok": True,
-                "selfie_ok": True,
-                "reason": reason,
-                "selfie_card_like": selfie_card_like,
-                "card_meta": card_meta,
-                "loose_meta": loose_meta,
-                "strict_meta": strict_meta,
-                "doc_face_reason": reason["doc"],
-                "doc_mode_used": ("auto_failed" if (doc_mode == "auto" and not doc_ok) else doc_mode),
-                "relax": bool(ignore_ar),
-                "use_center_crop": bool(use_center_crop),
-                "version": APP_VERSION,
-                "selfie_meta": s_meta,
-                "compare_source": "face_crops",
-                "doc_face_bbox": doc_meta_face.get("bbox") if isinstance(doc_meta_face, dict) else None,
-                "selfie_face_bbox": selfie_meta_face.get("bbox") if isinstance(selfie_meta_face, dict) else None,
-            }
-
-        # 3.c probar varios modelos/detectores (sin re-detección: detector_backend='skip')
-        model_primary = model_name or "ArcFace"
-        models_pool: List[str] = [model_primary, "Facenet512", "VGG-Face"]
-        seen = set(); models_pool = [m for m in models_pool if not (m in seen or seen.add(m))]
-        detectors_pool: List[str] = ["skip"]  # ya tenemos los crops
-
-        best = {"distance": 1.0, "model": None, "detector": "skip"}
-        trials = []
-
-        for m in models_pool:
-            try:
-                res = DeepFace.verify(
-                    img1_path=doc_face,
-                    img2_path=selfie_face,
-                    model_name=m,
-                    detector_backend="skip",
-                    distance_metric="cosine",
-                    enforce_detection=False
-                )
-                dist = float(res.get("distance", 1.0))
-                trials.append({"model": m, "detector": "skip", "distance": dist})
-                if dist < best["distance"]:
-                    best.update({"distance": dist, "model": m})
-            except Exception:
-                trials.append({"model": m, "detector": "skip", "distance": None})
-
-        verified = best["distance"] <= float(threshold)
-
+        # Ambos OK -> éxito (sin biometría)
         return {
             "ok": True,
-            "verified": bool(verified),
-            "distance": float(best["distance"]),
-            "threshold": float(threshold),
-            "model": best["model"],
-            "detector": best["detector"],
-            "enforce": bool(enforce),
-            "fallback_used": False,
-            "note": "face_crops with padding+align",
-
             "doc_ok": True,
             "selfie_ok": True,
+            "reason": {"doc": "ok", "selfie": "ok"},
+            "selfie_card_like": selfie_card_like,
             "card_meta": card_meta,
             "loose_meta": loose_meta,
             "strict_meta": strict_meta,
@@ -649,12 +563,8 @@ async def verify(
             "relax": bool(ignore_ar),
             "use_center_crop": bool(use_center_crop),
             "version": APP_VERSION,
-            "selfie_meta": {"reason": "ok", "area_ratio": area_ratio, "tight_crop": bool(auto_tight_crop)},
-
-            "compare_source": "face_crops",
-            "doc_face_bbox": doc_meta_face.get("bbox"),
-            "selfie_face_bbox": selfie_meta_face.get("bbox"),
-            "trials": trials,
+            "selfie_meta": {"reason": "ok", "area_ratio": area_ratio},
+            "biometric_skipped": True
         }
 
     except Exception as e:
