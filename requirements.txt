@@ -6,3 +6,4 @@ retina-face
 onnxruntime
 numpy
 Pillow
+tf-keras
