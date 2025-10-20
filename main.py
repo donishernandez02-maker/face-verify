@@ -29,7 +29,7 @@ CARD_ANGLE_TOL        = 35.0   # antes 25.0
 MIN_FACE_FRAC         = 0.12   # cara debe ocupar al menos 12% del lado menor del frame
 MAX_SELFIE_FACES      = 1      # exactamente una cara en selfie
 
-app = FastAPI(title="Face Verify API", version="1.3.0")
+app = FastAPI(title="Face Verify API", version="1.4.0")
 
 # CORS (útil para frontends)
 app.add_middleware(
@@ -100,7 +100,7 @@ def detect_card_quad(bgr: np.ndarray) -> Tuple[bool, Dict]:
     edges = cv2.Canny(gray, 50, 150)
     edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
 
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CAIN_APPROX_SIMPLE) if hasattr(cv2, "CAIN_APPROX_SIMPLE") else cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return False, {"reason": "no_contours"}
 
@@ -247,8 +247,7 @@ async def verify(
     selfie:   UploadFile = File(..., description="Selfie a validar"),
     threshold: float = Form(DEFAULT_THRESHOLD),
     detector:  str   = Form(APP_DETECTOR_DEFAULT),  # auto (default) | retinaface | opencv | ...
-    enforce:   bool  = Form(True),                  # aplica si detector != auto
-    doc_mode:  str   = Form("strict")               # 'strict' | 'loose'
+    enforce:   bool  = Form(True)                   # aplica si detector != auto
 ) -> Dict:
     try:
         # --------------------------
@@ -297,12 +296,12 @@ async def verify(
                 except Exception:
                     doc_ok_face = True  # si no hay datos, no bloqueamos
 
-        # Decisión estricta
+        # Decisión estricta primero
         doc_ok = bool(card_like and doc_ok_face)
+        doc_mode_used = "strict"
 
-        # --- Modo laxo (por si la foto está vertical o con fondo complejo) ---
-        if not doc_ok and doc_mode.lower() == "loose":
-            # Señales alternativas: rostro pequeño presente + AR global razonable + densidad de bordes en rango
+        # --- Fallback automático a 'loose' si strict falla ---
+        if not doc_ok:
             bgr_full = cv2.cvtColor(id_arr_rgb, cv2.COLOR_RGB2BGR)
             ar_global = doc_w / float(doc_h + 1e-9)
             dens = edge_density(bgr_full)
@@ -311,8 +310,9 @@ async def verify(
             dens_ok = 0.008 <= dens <= 0.30
             if doc_ok_face and ar_ok and dens_ok:
                 doc_ok = True
+                doc_mode_used = "loose"
                 card_meta = {
-                    "rotation": card_meta.get("rotation", 0),
+                    **(card_meta or {}),
                     "loose": True,
                     "ar_global": ar_global,
                     "edge_density": dens
@@ -355,7 +355,8 @@ async def verify(
                     "doc": ("not_card_like" if not doc_ok else "ok"),
                     "selfie": ("face_count!=1_or_too_small" if not selfie_ok else "ok")
                 },
-                "card_meta": card_meta
+                "card_meta": card_meta,
+                "doc_mode_used": doc_mode_used
             }
 
         # --------------------------
@@ -364,7 +365,7 @@ async def verify(
         # --------------------------
         doc_face_img = pick_best_face(doc_faces, prefer_larger=False)
         if doc_face_img is None or selfie_face_img is None:
-            return {"ok": False, "reason": "face_crop_failed"}
+            return {"ok": False, "reason": "face_crop_failed", "doc_mode_used": doc_mode_used}
 
         id_face_arr = np.array(doc_face_img)
         sf_face_arr = np.array(selfie_face_img)
@@ -401,6 +402,7 @@ async def verify(
         ver["doc_ok"] = True
         ver["selfie_ok"] = True
         ver["card_meta"] = card_meta
+        ver["doc_mode_used"] = doc_mode_used
         return ver
 
     except Exception as e:
