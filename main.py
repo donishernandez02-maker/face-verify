@@ -285,31 +285,29 @@ def check_document_like(img: np.ndarray,
                         text_max_center: float,
                         edge_max_global: float) -> Tuple[bool, dict, dict, dict, str]:
     """
-    Valida que el documento sea “card-like” y que contenga 1 rostro (estricto).
+    Valida doc con dos niveles:
+      - loose: métricas (edges/text/AR) + (opcional) quad
+      - strict: SOLO requiere que sea card-like (quad) y que haya exactamente 1 rostro en el doc.
     Retorna:
       - doc_ok (bool)
       - card_meta (dict)
-      - loose_meta (dict con criterios usados)
-      - strict_meta (dict con flags “card_like” y “doc_ok_face”)
+      - loose_meta (dict)
+      - strict_meta (dict)
       - doc_face_reason (str)
     """
-    # 1) mejor rotación que se vea card-like
+    # 1) Mejor rotación con forma de tarjeta
     rotated, card_meta = best_rotation_card(img)
 
-    # 2) métricas
+    # 2) Métricas global / center
     mg, mc = compute_doc_metrics(rotated)
+    used_center = False
     if use_center_crop:
-        crop = center_crop(rotated, CENTER_CROP_F)
-        mg_c, mc_c = compute_doc_metrics(crop)
-        # pero para checks usamos mg/mc del original rotado
-        _ = (mg_c, mc_c)  # solo por trazabilidad si quieres
+        _ = center_crop(rotated, CENTER_CROP_F)  # solo para trazabilidad si quisieras re-medir
         used_center = True
-    else:
-        used_center = False
 
     quad_like = (card_meta.get("reason") == "ok")
 
-    # 3) loose/strict
+    # 3) Decisión loose (bordes/text/AR)
     loose_ok, checks_g, checks_c = evaluate_doc_checks(
         mg, mc,
         require_quad=require_quad,
@@ -319,30 +317,31 @@ def check_document_like(img: np.ndarray,
         quad_like=quad_like
     )
 
-    # Estricto además exige 1 rostro detectable en el doc
+    # 4) Presencia de 1 rostro en el documento
     doc_face_ok, face_meta = deepface_single_face(rotated, detector_backend=APP_DETECTOR_DEFAULT)
-    strict_ok = (loose_ok and doc_face_ok)
 
+    # 5) Decisiones finales por modo
+    # strict: SOLO quad_like + 1 rostro (sin edges/text/AR)
+    strict_decision = (quad_like and doc_face_ok)
+    strict_meta = {
+        "strict_card_like": bool(quad_like),
+        "strict_doc_ok_face": bool(doc_face_ok),
+    }
     loose_meta = {
         "loose": bool(loose_ok),
         "criteria_global": checks_g,
         "used_center_crop": bool(used_center),
         "criteria_center": checks_c,
     }
-    strict_meta = {
-        "strict_card_like": bool(quad_like),
-        "strict_doc_ok_face": bool(doc_face_ok),
-    }
-    doc_face_reason = face_meta.get("reason", "ok") if not doc_face_ok else "ok"
+    doc_face_reason = "ok" if doc_face_ok else face_meta.get("reason", "face_count")
 
-    # doc_mode
     if doc_mode == "strict":
-        return strict_ok, card_meta, loose_meta, strict_meta, ("" if strict_ok else doc_face_reason)
+        return strict_decision, card_meta, loose_meta, strict_meta, ("" if strict_decision else doc_face_reason)
     if doc_mode == "loose":
         return loose_ok, card_meta, loose_meta, strict_meta, ("" if loose_ok else doc_face_reason)
-    # auto: si strict falla, no pasamos; si no queremos tan fuerte, se podría relajar,
-    # pero conservamos seguridad → requiere strict_ok
-    return strict_ok, card_meta, loose_meta, strict_meta, ("" if strict_ok else doc_face_reason)
+    # auto = strict
+    return strict_decision, card_meta, loose_meta, strict_meta, ("" if strict_decision else doc_face_reason)
+
 
 # =========================
 # Selfie helpers
